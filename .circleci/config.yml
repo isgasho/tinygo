@@ -42,6 +42,35 @@ commands:
             sudo tar -C /usr/local -xf node-v10.15.1-linux-x64.tar.xz
             sudo ln -s /usr/local/node-v10.15.1-linux-x64/bin/node /usr/bin/node
             rm node-v10.15.1-linux-x64.tar.xz
+  download-llvm:
+    parameters:
+      branch:
+        type: string
+    steps:
+      - run:
+          name: "Download LLVM"
+          command: |
+            if [ ! -f ~/llvm/README.txt ]
+            then
+              git clone -b <<parameters.branch>> https://github.com/llvm-mirror/llvm.git  ~/llvm
+              git clone -b <<parameters.branch>> https://github.com/llvm-mirror/clang.git ~/llvm/tools/clang
+              git clone -b <<parameters.branch>> https://github.com/llvm-mirror/lld.git   ~/llvm/tools/lld
+            fi
+  build-llvm:
+    steps:
+      - run:
+          name: "Build LLVM"
+          command: |
+            if [ ! -f ~/llvm-build/lib/liblldELF.a ]
+            then
+              sudo apt-get install cmake clang ninja-build
+              export CC=clang
+              export CXX=clang++
+              mkdir ~/llvm-build
+              cd ~/llvm-build
+              cmake -G Ninja ../llvm "-DLLVM_TARGETS_TO_BUILD=X86;ARM;AArch64;WebAssembly" "-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=AVR" -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=OFF -DLIBCLANG_BUILD_STATIC=ON
+              ninja -j3
+            fi
   dep:
     steps:
       - run:
@@ -49,6 +78,12 @@ commands:
           command: |
             curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
             dep ensure --vendor-only
+  build-tinygo-release:
+    steps:
+      - run:
+          name: "Build TinyGo statically"
+          command: |
+            make release -j4 LLVM_BUILDDIR=~/llvm-build CLANG_SRC=~/llvm/tools/clang LLD_SRC=~/llvm/tools/lld
   smoketest:
     steps:
       - run: tinygo build -size short -o test.elf -target=pca10040            examples/blinky1
@@ -96,7 +131,79 @@ jobs:
             - ~/.cache/go-build
             - ~/.cache/tinygo
 
+  test-llvm8static-go111:
+    docker:
+      - image: circleci/golang:1.11
+
+    working_directory: /go/src/github.com/tinygo-org/tinygo
+    steps:
+      - checkout
+      - submodules
+      - run:
+          name: "Install apt dependencies"
+          command: |
+            sudo apt-get install \
+                libtinfo-dev \
+                python3 \
+                gcc-arm-linux-gnueabihf \
+                binutils-arm-none-eabi \
+                libc6-dev-armel-cross \
+                gcc-aarch64-linux-gnu \
+                libc6-dev-arm64-cross \
+                qemu-system-arm \
+                qemu-user \
+                gcc-avr \
+                avr-libc
+      - install-node
+      - restore_cache:
+          keys:
+            - go-cache-{{ checksum "Gopkg.lock" }}-{{ .Environment.CIRCLE_PREVIOUS_BUILD_NUM }}
+            - go-cache-{{ checksum "Gopkg.lock" }}
+      - restore_cache:
+          keys:
+            - llvm-source-8
+      - download-llvm:
+          branch: "release_80"
+      - save_cache:
+          key: llvm-source-8
+          paths:
+            ~/llvm
+      - restore_cache:
+          keys:
+            - llvm-build-8
+      - build-llvm
+      - save_cache:
+          key: llvm-build-8
+          paths:
+            ~/llvm-build
+      - run:
+          name: "Create LLVM symlinks"
+          command: |
+            ln -s ~/llvm-build/bin/clang-8 /go/bin/clang-8
+            ln -s ~/llvm-build/bin/llvm-ar /go/bin/llvm-ar-8
+            ln -s ~/llvm-build/bin/ld.lld  /go/bin/ld.lld-8
+            ln -s ~/llvm-build/bin/wasm-ld /go/bin/wasm-ld-8
+      - dep
+      - build-tinygo-release
+      - store_artifacts:
+          path: build/release.tar.gz
+      - run:
+          name: "Extract release tarball"
+          command: |
+            mkdir -p ~/lib
+            tar -C ~/lib -xf build/release.tar.gz
+            ln -s ~/lib/tinygo/bin/tinygo /go/bin/tinygo
+            tinygo version
+      - smoketest
+      - save_cache:
+          key: go-cache-{{ checksum "Gopkg.lock" }}-{{ .Environment.CIRCLE_BUILD_NUM }}
+          paths:
+            - ~/.cache/go-build
+            - ~/.cache/tinygo
+
+
 workflows:
   test-all:
     jobs:
       - test-llvm8-go111
+      - test-llvm8static-go111
